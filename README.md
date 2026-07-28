@@ -75,6 +75,31 @@
 
 ---
 
+## Modified LightRAG: LLM-Based Entity Merging
+
+> This repository is a modified version of [HKUDS/LightRAG](https://github.com/HKUDS/LightRAG). It adds an LLM-based entity merging step to the knowledge-graph indexing pipeline.
+
+After LightRAG extracts entities and relationships from all chunks of a document, the modified pipeline sends the extracted entity names and their descriptions to the `extract` role LLM in one bounded batch. The LLM resolves unambiguous aliases, abbreviations, pronouns, titles, and short names to a canonical entity before the graph and recovery indexes are written.
+
+```text
+Document chunking
+  -> Entity and relationship extraction
+  -> LLM-based entity merging
+  -> Knowledge graph and vector index persistence
+```
+
+When entities are merged, relationship endpoints are remapped to the canonical entity, alias-created self-loops are removed, and the original names are retained as aliases. Ambiguous entities remain separate. If the merge request fails or returns invalid output, LightRAG safely keeps the original extracted entities.
+
+The merge step is enabled by default and reuses the configured `extract` role LLM. Its input and cost are bounded by the following settings:
+
+```dotenv
+ENABLE_LLM_ENTITY_MERGE=true
+ENTITY_MERGE_MAX_ENTITIES=100
+ENTITY_MERGE_DESCRIPTION_TOKENS=80
+```
+
+For best indexing performance, use a fast non-reasoning model for the `extract` role, or disable thinking mode for that role.
+
 ## 🎉 News
 - [2026.05]🎯[New Feature]: **Merge RagAnything into LightRAG**🎉. Multimodal content parsing and extraction via **MinerU / Docling** services.
 - [2026.05]🎯[New Feature]: Introducing four selectable text chunking strategies: `Fix`, `Recursive`, `Vector`, and `Paragraph`.

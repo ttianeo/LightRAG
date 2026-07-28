@@ -17,7 +17,10 @@ import pytest
 import lightrag.operate as operate
 from lightrag.exceptions import IndexFlushError
 from lightrag.kg.shared_storage import initialize_share_data
-from lightrag.operate import merge_nodes_and_edges
+from lightrag.operate import (
+    merge_chunk_results_entities_with_llm,
+    merge_nodes_and_edges,
+)
 
 
 class _FakeTokenizer:
@@ -155,12 +158,13 @@ async def _merge(chunk_results, order: _OrderLog, **overrides):
     }
     stores.update({k: v for k, v in overrides.items() if k in stores})
     graph = overrides.get("graph") or _MemGraph(order)
+    config = overrides.get("config") or _cfg()
     await merge_nodes_and_edges(
         chunk_results,
         graph,
         _MemVdb(),
         _MemVdb(),
-        _cfg(),
+        config,
         full_entities_storage=stores["full_entities"],
         full_relations_storage=stores["full_relations"],
         doc_id="d1",
@@ -195,6 +199,54 @@ async def test_anchors_written_and_flushed_before_first_graph_mutation():
             f"{prefix} (at {idx}) must precede the first graph mutation "
             f"(at {first_mutation}): {order.events}"
         )
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_llm_entity_merge_updates_graph_and_recovery_anchor_names():
+    async def fake_llm(_prompt, **_kwargs):
+        return (
+            '{"groups":[{"canonical":"International Business Machines",'
+            '"members":["IBM","International Business Machines"]}]}'
+        )
+
+    config = {
+        **_cfg(),
+        "enable_llm_entity_merge": True,
+        "entity_merge_max_entities": 100,
+        "entity_merge_description_tokens": 80,
+        "role_llm_funcs": {"extract": fake_llm},
+        "llm_cache_identities": {},
+    }
+    chunk_results = [
+        (
+            {
+                "IBM": [_node_dp("IBM", "c1")],
+                "International Business Machines": [
+                    _node_dp("International Business Machines", "c2")
+                ],
+            },
+            {},
+        )
+    ]
+
+    resolved_results = await merge_chunk_results_entities_with_llm(
+        chunk_results,
+        config,
+    )
+    graph, stores = await _merge(
+        resolved_results,
+        _OrderLog(),
+    )
+
+    canonical = "International Business Machines"
+    assert set(graph.nodes) == {canonical}
+    assert graph.nodes[canonical]["aliases"] == "IBM"
+    assert len(graph.nodes[canonical]["description"].split(operate.GRAPH_FIELD_SEP)) == 2
+    assert stores["full_entities"].data["d1"] == {
+        "entity_names": [canonical],
+        "count": 1,
+    }
 
 
 @pytest.mark.offline

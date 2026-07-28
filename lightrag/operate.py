@@ -1634,6 +1634,12 @@ async def _rebuild_single_entity(
     current_entity = await knowledge_graph_inst.get_node(entity_name)
     if not current_entity:
         return False
+    entity_name_variants = {entity_name}
+    stored_aliases = current_entity.get("aliases") or ""
+    if isinstance(stored_aliases, str):
+        entity_name_variants.update(
+            alias for alias in stored_aliases.split(GRAPH_FIELD_SEP) if alias
+        )
 
     # Helper function to update entity in both graph and vector storage
     async def _update_entity_storage(
@@ -1660,8 +1666,10 @@ async def _rebuild_single_entity(
 
             # Update entity in vector database (equally critical)
             entity_vdb_id = compute_mdhash_id(entity_name, prefix="ent-")
+            aliases = current_entity.get("aliases") or ""
+            alias_context = f"\nAliases: {aliases}" if aliases else ""
             entity_content = _truncate_vdb_content(
-                f"{entity_name}\n{final_description}",
+                f"{entity_name}{alias_context}\n{final_description}",
                 global_config,
                 f"entity:{entity_name}",
             )
@@ -1718,8 +1726,11 @@ async def _rebuild_single_entity(
     # Collect all entity data from relevant (limited) chunks
     all_entity_data = []
     for chunk_id in limited_chunk_ids:
-        if chunk_id in chunk_entities and entity_name in chunk_entities[chunk_id]:
-            all_entity_data.extend(chunk_entities[chunk_id][entity_name])
+        if chunk_id not in chunk_entities:
+            continue
+        for candidate_name in entity_name_variants:
+            if candidate_name in chunk_entities[chunk_id]:
+                all_entity_data.extend(chunk_entities[chunk_id][candidate_name])
 
     if not all_entity_data:
         if structural_fallback:
@@ -1904,6 +1915,23 @@ async def _rebuild_single_relationship(
     if not current_relationship:
         return False
 
+    src_node, tgt_node = await asyncio.gather(
+        knowledge_graph_inst.get_node(src),
+        knowledge_graph_inst.get_node(tgt),
+    )
+
+    def _name_variants(entity_name: str, node_data: dict | None) -> set[str]:
+        variants = {entity_name}
+        aliases_value = (node_data or {}).get("aliases") or ""
+        if isinstance(aliases_value, str):
+            variants.update(
+                alias for alias in aliases_value.split(GRAPH_FIELD_SEP) if alias
+            )
+        return variants
+
+    src_variants = _name_variants(src, src_node)
+    tgt_variants = _name_variants(tgt, tgt_node)
+
     # normalized_chunk_ids = merge_source_ids([], chunk_ids)
     normalized_chunk_ids = chunk_ids
 
@@ -1931,13 +1959,17 @@ async def _rebuild_single_relationship(
     # Collect all relationship data from relevant chunks
     all_relationship_data = []
     for chunk_id in limited_chunk_ids:
-        if chunk_id in chunk_relationships:
-            # Check both (src, tgt) and (tgt, src) since relationships can be bidirectional
-            for edge_key in [(src, tgt), (tgt, src)]:
-                if edge_key in chunk_relationships[chunk_id]:
-                    all_relationship_data.extend(
-                        chunk_relationships[chunk_id][edge_key]
-                    )
+        if chunk_id not in chunk_relationships:
+            continue
+        for edge_key, relationship_data in chunk_relationships[chunk_id].items():
+            edge_src, edge_tgt = edge_key
+            if (
+                edge_src in src_variants
+                and edge_tgt in tgt_variants
+                or edge_src in tgt_variants
+                and edge_tgt in src_variants
+            ):
+                all_relationship_data.extend(relationship_data)
 
     degraded = not all_relationship_data
     if degraded and not structural_fallback:
@@ -2247,6 +2279,7 @@ async def _merge_nodes_then_upsert(
         already_source_ids = []
         already_description = []
         already_file_paths = []
+        already_aliases = []
 
         # 1. Get existing node data from knowledge graph
         already_node = await knowledge_graph_inst.get_node(entity_name)
@@ -2279,6 +2312,10 @@ async def _merge_nodes_then_upsert(
             existing_desc = (already_node.get("description") or "").strip()
             if existing_desc:
                 already_description.extend(existing_desc.split(GRAPH_FIELD_SEP))
+
+            existing_aliases = (already_node.get("aliases") or "").strip()
+            if existing_aliases:
+                already_aliases.extend(existing_aliases.split(GRAPH_FIELD_SEP))
 
         new_source_ids = [dp["source_id"] for dp in nodes_data if dp.get("source_id")]
 
@@ -2360,6 +2397,24 @@ async def _merge_nodes_then_upsert(
 
         # 6.1 Finalize source_id
         source_id = GRAPH_FIELD_SEP.join(source_ids)
+
+        # Preserve the LLM-resolved aliases on the graph node. This is required
+        # by cached-extraction rebuilds: extraction cache entries retain the raw
+        # names, while the graph and recovery indexes use the canonical name.
+        new_aliases = []
+        for node in nodes_data:
+            aliases_value = node.get("aliases")
+            if isinstance(aliases_value, str):
+                new_aliases.extend(aliases_value.split(GRAPH_FIELD_SEP))
+            elif isinstance(aliases_value, list):
+                new_aliases.extend(
+                    alias for alias in aliases_value if isinstance(alias, str)
+                )
+        aliases = GRAPH_FIELD_SEP.join(
+            alias
+            for alias in merge_source_ids(already_aliases, new_aliases)
+            if alias and alias != entity_name
+        )
 
         # 6.2 Finalize entity type by highest count
         entity_type = sorted(
@@ -2519,6 +2574,7 @@ async def _merge_nodes_then_upsert(
             file_path=file_path,
             created_at=int(time.time()),
             truncate=truncation_info,
+            aliases=aliases,
         )
         await knowledge_graph_inst.upsert_node(
             entity_name,
@@ -2527,8 +2583,9 @@ async def _merge_nodes_then_upsert(
         node_data["entity_name"] = entity_name
         if entity_vdb is not None:
             entity_vdb_id = compute_mdhash_id(str(entity_name), prefix="ent-")
+            alias_context = f"\nAliases: {aliases}" if aliases else ""
             entity_content = _truncate_vdb_content(
-                f"{entity_name}\n{description}",
+                f"{entity_name}{alias_context}\n{description}",
                 global_config,
                 f"entity:{entity_name}",
             )
@@ -3048,8 +3105,13 @@ async def _merge_edges_then_upsert(
                     # Update vector database
                     if entity_vdb is not None:
                         entity_vdb_id = compute_mdhash_id(need_insert_id, prefix="ent-")
+                        existing_aliases = existing_node.get("aliases") or ""
+                        alias_context = (
+                            f"\nAliases: {existing_aliases}" if existing_aliases else ""
+                        )
                         entity_content = (
-                            f"{need_insert_id}\n{existing_node.get('description', '')}"
+                            f"{need_insert_id}{alias_context}\n"
+                            f"{existing_node.get('description', '')}"
                         )
                         vdb_data = {
                             entity_vdb_id: {
@@ -3182,6 +3244,270 @@ async def _merge_edges_then_upsert(
         )
 
 
+def _truncate_entity_merge_description(
+    description: str,
+    tokenizer: Tokenizer | None,
+    max_tokens: int,
+) -> str:
+    """Bound one entity description before adding it to the merge prompt."""
+    if not description or max_tokens <= 0:
+        return ""
+
+    if tokenizer is None:
+        # Conservative fallback for direct/custom callers without a tokenizer.
+        return description[: max_tokens * 4]
+
+    token_ids = tokenizer.encode(description)
+    if len(token_ids) <= max_tokens:
+        return description
+    return tokenizer.decode(token_ids[:max_tokens]).rstrip()
+
+
+def _build_entity_merge_payload(
+    all_nodes: dict[str, list[dict]],
+    *,
+    max_entities: int,
+    description_tokens: int,
+    tokenizer: Tokenizer | None,
+) -> dict[str, list[dict[str, str]]]:
+    """Build a deterministic, bounded name+description payload for one LLM call."""
+    if max_entities < 2 or description_tokens <= 0:
+        return {"entities": []}
+
+    entities = []
+    for entity_name in sorted(all_nodes)[:max_entities]:
+        # Sorting exact-deduplicated fragments makes the prompt/cache key stable
+        # even when concurrent chunk extraction completes in a different order.
+        descriptions = sorted(
+            {
+                sanitized
+                for node in all_nodes[entity_name]
+                if (
+                    sanitized := sanitize_text_for_encoding(
+                        str(node.get("description") or "")
+                    )
+                )
+            }
+        )
+        description = _truncate_entity_merge_description(
+            "\n".join(descriptions),
+            tokenizer,
+            description_tokens,
+        )
+        entities.append({"name": entity_name, "description": description})
+
+    return {"entities": entities}
+
+
+def _parse_entity_merge_mapping(
+    result: str,
+    candidate_names: set[str],
+) -> dict[str, str]:
+    """Validate an LLM merge response and return member -> canonical mappings.
+
+    Validation is deliberately fail-closed: invented names, singleton groups,
+    missing canonicals, and overlapping group membership are ignored.
+    """
+    parsed = tolerant_load_json_dict(result)
+    groups = parsed.get("groups") if isinstance(parsed, dict) else None
+    if not isinstance(groups, list):
+        logger.warning("LLM entity merge returned no valid `groups` list")
+        return {}
+
+    valid_groups: list[tuple[str, tuple[str, ...]]] = []
+    membership_counts: Counter[str] = Counter()
+    rejected_groups = 0
+
+    for group in groups:
+        if not isinstance(group, dict):
+            rejected_groups += 1
+            continue
+
+        canonical = group.get("canonical")
+        members = group.get("members")
+        if not isinstance(canonical, str) or not isinstance(members, list):
+            rejected_groups += 1
+            continue
+        if any(not isinstance(member, str) for member in members):
+            rejected_groups += 1
+            continue
+
+        unique_members = tuple(dict.fromkeys(members))
+        if (
+            len(unique_members) < 2
+            or canonical not in unique_members
+            or any(member not in candidate_names for member in unique_members)
+        ):
+            rejected_groups += 1
+            continue
+
+        valid_groups.append((canonical, unique_members))
+        membership_counts.update(unique_members)
+
+    mapping: dict[str, str] = {}
+    for canonical, members in valid_groups:
+        if any(membership_counts[member] != 1 for member in members):
+            rejected_groups += 1
+            continue
+        mapping.update({member: canonical for member in members})
+
+    if rejected_groups:
+        logger.warning(
+            "LLM entity merge ignored %d invalid or conflicting group(s)",
+            rejected_groups,
+        )
+    return mapping
+
+
+def _apply_entity_merge_mapping(
+    all_nodes: dict[str, list[dict]],
+    all_edges: dict[tuple[str, str], list[dict]],
+    mapping: dict[str, str],
+) -> tuple[dict[str, list[dict]], dict[tuple[str, str], list[dict]]]:
+    """Rewrite entity keys and relationship endpoints using a validated mapping."""
+    if not mapping:
+        return all_nodes, all_edges
+
+    aliases_by_canonical: defaultdict[str, list[str]] = defaultdict(list)
+    for member, canonical in mapping.items():
+        if member != canonical:
+            aliases_by_canonical[canonical].append(member)
+
+    resolved_nodes: defaultdict[str, list[dict]] = defaultdict(list)
+    for entity_name, nodes in all_nodes.items():
+        canonical = mapping.get(entity_name, entity_name)
+        canonical_aliases = GRAPH_FIELD_SEP.join(
+            sorted(aliases_by_canonical.get(canonical, []))
+        )
+        for node in nodes:
+            resolved_node = dict(node)
+            resolved_node["entity_name"] = canonical
+            if canonical_aliases:
+                resolved_node["aliases"] = canonical_aliases
+            resolved_nodes[canonical].append(resolved_node)
+
+    resolved_edges: defaultdict[tuple[str, str], list[dict]] = defaultdict(list)
+    for edges in all_edges.values():
+        for edge in edges:
+            src_id = mapping.get(edge["src_id"], edge["src_id"])
+            tgt_id = mapping.get(edge["tgt_id"], edge["tgt_id"])
+            if src_id == tgt_id:
+                # Alias-to-canonical edges become self-loops and carry no graph
+                # information after resolution.
+                continue
+
+            resolved_edge = dict(edge)
+            resolved_edge["src_id"] = src_id
+            resolved_edge["tgt_id"] = tgt_id
+            resolved_edges[tuple(sorted((src_id, tgt_id)))].append(resolved_edge)
+
+    return dict(resolved_nodes), dict(resolved_edges)
+
+
+async def merge_extracted_entities_with_llm(
+    all_nodes: dict[str, list[dict]],
+    all_edges: dict[tuple[str, str], list[dict]],
+    global_config: dict[str, Any],
+    llm_response_cache: BaseKVStorage | None = None,
+) -> tuple[
+    dict[str, list[dict]],
+    dict[tuple[str, str], list[dict]],
+    dict[str, str],
+]:
+    """Resolve document-local entity aliases with one bounded extract-role call."""
+    if not global_config.get("enable_llm_entity_merge", False) or len(all_nodes) < 2:
+        return all_nodes, all_edges, {}
+
+    use_llm_func = (global_config.get("role_llm_funcs") or {}).get("extract")
+    if not callable(use_llm_func):
+        logger.warning("LLM entity merge skipped: extract-role LLM is unavailable")
+        return all_nodes, all_edges, {}
+
+    max_entities = max(0, int(global_config.get("entity_merge_max_entities", 100)))
+    description_tokens = max(
+        0, int(global_config.get("entity_merge_description_tokens", 80))
+    )
+    payload = _build_entity_merge_payload(
+        all_nodes,
+        max_entities=max_entities,
+        description_tokens=description_tokens,
+        tokenizer=global_config.get("tokenizer"),
+    )
+    entities = payload["entities"]
+    if len(entities) < 2:
+        return all_nodes, all_edges, {}
+    if len(entities) < len(all_nodes):
+        logger.info(
+            "LLM entity merge capped candidates at %d/%d entities",
+            len(entities),
+            len(all_nodes),
+        )
+
+    entity_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    user_prompt = PROMPTS["entity_merge_user_prompt"].format(
+        entity_payload=entity_payload
+    )
+    result, _ = await use_llm_func_with_cache(
+        user_prompt,
+        use_llm_func,
+        system_prompt=PROMPTS["entity_merge_system_prompt"],
+        llm_response_cache=llm_response_cache,
+        cache_type="entity_merge",
+        response_format={"type": "json_object"},
+        max_tokens=min(2048, max(256, len(entities) * 20)),
+        llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
+    )
+
+    candidate_names = {entity["name"] for entity in entities}
+    mapping = _parse_entity_merge_mapping(result, candidate_names)
+    if not mapping:
+        return all_nodes, all_edges, {}
+
+    resolved_nodes, resolved_edges = _apply_entity_merge_mapping(
+        all_nodes, all_edges, mapping
+    )
+    merged_alias_count = sum(
+        1 for member, canonical in mapping.items() if member != canonical
+    )
+    logger.info(
+        "LLM entity merge resolved %d alias(es) across %d candidate entities",
+        merged_alias_count,
+        len(entities),
+    )
+    return resolved_nodes, resolved_edges, mapping
+
+
+async def merge_chunk_results_entities_with_llm(
+    chunk_results: list,
+    global_config: dict[str, Any],
+    llm_response_cache: BaseKVStorage | None = None,
+) -> list:
+    """Resolve aliases across all chunks before any recovery index is derived."""
+    all_nodes: defaultdict[str, list[dict]] = defaultdict(list)
+    all_edges: defaultdict[tuple[str, str], list[dict]] = defaultdict(list)
+    for maybe_nodes, maybe_edges in chunk_results:
+        for entity_name, entities in maybe_nodes.items():
+            all_nodes[entity_name].extend(entities)
+        for edge_key, edges in maybe_edges.items():
+            all_edges[tuple(sorted(edge_key))].extend(edges)
+
+    resolved_nodes, resolved_edges, mapping = (
+        await merge_extracted_entities_with_llm(
+            dict(all_nodes),
+            dict(all_edges),
+            global_config,
+            llm_response_cache,
+        )
+    )
+    if not mapping:
+        return chunk_results
+
+    # Once aliases are rewritten, per-chunk grouping no longer carries useful
+    # identity information. Returning one aggregate keeps graph merge and every
+    # pre-merge recovery/journal candidate calculation on the same canonical set.
+    return [(resolved_nodes, resolved_edges)]
+
+
 def collect_kg_merge_candidates(
     chunk_results: list,
 ) -> tuple[set[str], set[tuple[str, str]]]:
@@ -3310,7 +3636,7 @@ async def merge_nodes_and_edges(
     # candidates must overwrite the stale anchors of the previous attempt.
     if full_entities_storage and full_relations_storage and doc_id:
         candidate_entities, candidate_relations = collect_kg_merge_candidates(
-            chunk_results
+            [(all_nodes, all_edges)]
         )
         log_message = (
             f"Phase 0: Writing recovery indexes for {doc_id}: "

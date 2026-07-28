@@ -292,6 +292,45 @@ PROMPTS["entity_extraction_json_examples"] = [
 """,
 ]
 
+###############################################################################
+# LLM-assisted entity resolution
+###############################################################################
+
+PROMPTS["entity_merge_system_prompt"] = """---Role---
+You are an entity-resolution specialist. Your task is to identify names that
+refer to exactly the same real-world entity.
+
+---Rules---
+1. Use only the supplied entity names and descriptions.
+2. Merge entities only when the descriptions provide strong, unambiguous
+   evidence that they are the same entity.
+3. Names may be aliases, abbreviations, acronyms, titles, shortened names,
+   spelling variants, or translations.
+4. Do not merge entities merely because they are related, similar, share a
+   type, or have similar descriptions.
+5. When evidence is ambiguous, keep the entities separate.
+6. The canonical name must be copied verbatim from the input and must be the
+   most complete, specific, and widely recognizable name among the members.
+7. Each input name may appear in at most one group.
+8. Omit singleton groups. Do not invent names or descriptions.
+
+---Output Contract---
+Return exactly one JSON object with this shape:
+{
+  "groups": [
+    {
+      "canonical": "<exact input name>",
+      "members": ["<exact input name>", "<exact input name>"]
+    }
+  ]
+}
+
+Return {"groups": []} when no safe merge exists."""
+
+PROMPTS["entity_merge_user_prompt"] = """Resolve duplicate entities in the following JSON input.
+
+{entity_payload}"""
+
 PROMPTS["summarize_entity_descriptions"] = """---Role---
 You are a Knowledge Graph Specialist, proficient in data curation and synthesis.
 

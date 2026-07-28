@@ -45,6 +45,9 @@ from lightrag.constants import (
     DEFAULT_MAX_GLEANING,
     DEFAULT_MAX_EXTRACTION_RECORDS,
     DEFAULT_MAX_EXTRACTION_ENTITIES,
+    DEFAULT_ENABLE_LLM_ENTITY_MERGE,
+    DEFAULT_ENTITY_MERGE_MAX_ENTITIES,
+    DEFAULT_ENTITY_MERGE_DESCRIPTION_TOKENS,
     DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
     DEFAULT_TOP_K,
     DEFAULT_CHUNK_TOP_K,
@@ -130,6 +133,7 @@ from lightrag.operate import (
     collect_kg_merge_candidates,
     extract_entities,
     kg_query,
+    merge_chunk_results_entities_with_llm,
     merge_nodes_and_edges,
     naive_query,
     rebuild_knowledge_from_chunks,
@@ -145,7 +149,7 @@ from lightrag.utils_pipeline import (
     normalize_document_file_path,
 )
 from lightrag.constants import GRAPH_FIELD_SEP
-from lightrag.exceptions import IndexFlushError
+from lightrag.exceptions import IndexFlushError, PipelineCancelledException
 from lightrag.utils import (
     Tokenizer,
     TiktokenTokenizer,
@@ -388,6 +392,29 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         )
     )
     """Per-response cap on entity rows/objects."""
+
+    enable_llm_entity_merge: bool = field(
+        default=get_env_value(
+            "ENABLE_LLM_ENTITY_MERGE", DEFAULT_ENABLE_LLM_ENTITY_MERGE, bool
+        )
+    )
+    """Use one bounded LLM call per document to merge unambiguous entity aliases."""
+
+    entity_merge_max_entities: int = field(
+        default=get_env_value(
+            "ENTITY_MERGE_MAX_ENTITIES", DEFAULT_ENTITY_MERGE_MAX_ENTITIES, int
+        )
+    )
+    """Maximum number of extracted entities sent to one entity-merge LLM call."""
+
+    entity_merge_description_tokens: int = field(
+        default=get_env_value(
+            "ENTITY_MERGE_DESCRIPTION_TOKENS",
+            DEFAULT_ENTITY_MERGE_DESCRIPTION_TOKENS,
+            int,
+        )
+    )
+    """Maximum description tokens supplied to the merge LLM for each entity."""
 
     force_llm_summary_on_merge: int = field(
         default=get_env_value(
@@ -2806,14 +2833,33 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         self, chunk: dict[str, Any], pipeline_status=None, pipeline_status_lock=None
     ) -> list:
         try:
+            global_config = self._build_global_config()
             chunk_results = await extract_entities(
                 chunk,
-                global_config=self._build_global_config(),
+                global_config=global_config,
                 pipeline_status=pipeline_status,
                 pipeline_status_lock=pipeline_status_lock,
                 llm_response_cache=self.llm_response_cache,
                 text_chunks_storage=self.text_chunks,
             )
+            if global_config.get("enable_llm_entity_merge", False):
+                try:
+                    chunk_results = await merge_chunk_results_entities_with_llm(
+                        chunk_results,
+                        global_config,
+                        self.llm_response_cache,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except PipelineCancelledException:
+                    raise
+                except Exception as merge_error:
+                    # Entity resolution improves graph quality but must not turn
+                    # an otherwise valid extraction into a failed document.
+                    logger.warning(
+                        "LLM entity merge failed; keeping original entities: %s",
+                        merge_error,
+                    )
             return chunk_results
         except Exception as e:
             error_msg = f"Failed to extract entities and relationships: {str(e)}"

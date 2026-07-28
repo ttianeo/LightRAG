@@ -26,6 +26,14 @@ DEFAULT_ENTITY_NAME_MAX_BYTES = 512
 DEFAULT_MAX_EXTRACTION_RECORDS = 100
 DEFAULT_MAX_EXTRACTION_ENTITIES = 40
 
+# LLM-assisted entity resolution runs once per document after all chunk-level
+# extraction results have been collected and before graph mutation. The
+# candidate and per-entity description caps keep the prompt bounded without
+# falling back to O(n^2) pairwise comparisons.
+DEFAULT_ENABLE_LLM_ENTITY_MERGE = True
+DEFAULT_ENTITY_MERGE_MAX_ENTITIES = 100
+DEFAULT_ENTITY_MERGE_DESCRIPTION_TOKENS = 80
+
 # Number of description fragments to trigger LLM summary
 DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE = 8
 # Max description token size to trigger LLM summary
